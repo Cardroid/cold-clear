@@ -1,9 +1,9 @@
-use std::collections::VecDeque;
 use std::iter::DoubleEndedIterator;
 
 use arrayvec::ArrayVec;
 use enumset::EnumSet;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::*;
 
@@ -14,7 +14,9 @@ pub struct Board<R = u16> {
     pub combo: u32,
     pub b2b_bonus: bool,
     pub hold_piece: Option<Piece>,
-    next_pieces: VecDeque<Piece>,
+    /// Stored inline so that cloning a board (which happens for every generated placement)
+    /// doesn't need to allocate. Longer queues spill to the heap.
+    next_pieces: SmallVec<[Piece; 16]>,
     pub bag: EnumSet<Piece>,
 }
 
@@ -63,7 +65,7 @@ impl<R: Row> Board<R> {
             combo: 0,
             b2b_bonus: false,
             hold_piece: None,
-            next_pieces: VecDeque::new(),
+            next_pieces: SmallVec::new(),
             bag: EnumSet::all(),
         }
     }
@@ -82,7 +84,7 @@ impl<R: Row> Board<R> {
             combo: combo,
             b2b_bonus: b2b,
             hold_piece: hold,
-            next_pieces: VecDeque::new(),
+            next_pieces: SmallVec::new(),
             bag: if bag_remain.is_empty() {
                 EnumSet::all()
             } else {
@@ -107,7 +109,7 @@ impl<R: Row> Board<R> {
     ///
     /// If the queue is empty, returns the set of possible next pieces.
     pub fn get_next_piece(&self) -> Result<Piece, EnumSet<Piece>> {
-        self.next_pieces.front().copied().ok_or(self.bag)
+        self.next_pieces.first().copied().ok_or(self.bag)
     }
 
     /// Retrieves the piece after the next piece in the queue if it is known.
@@ -123,7 +125,7 @@ impl<R: Row> Board<R> {
         if self.bag.is_empty() {
             self.bag = EnumSet::all();
         }
-        self.next_pieces.push_back(piece);
+        self.next_pieces.push(piece);
     }
 
     fn remove_cleared_lines(&mut self) -> ArrayVec<[i32; 4]> {
@@ -293,7 +295,11 @@ impl<R: Row> Board<R> {
 
     /// Returns the piece that should be spawned, or None if the queue is empty.
     pub fn advance_queue(&mut self) -> Option<Piece> {
-        self.next_pieces.pop_front()
+        if self.next_pieces.is_empty() {
+            None
+        } else {
+            Some(self.next_pieces.remove(0))
+        }
     }
 
     pub fn column_heights(&self) -> &[i32; 10] {
