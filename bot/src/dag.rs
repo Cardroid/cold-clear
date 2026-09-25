@@ -78,6 +78,7 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::ControlFlow;
 
 use arrayvec::ArrayVec;
@@ -136,7 +137,71 @@ struct Generation<E: 'static, R: 'static> {
 struct GenerationData<'c, E, R> {
     nodes: Vec<Node<'c, E>>,
     children: Children<'c, R>,
-    deduplicator: HashMap<SimplifiedBoard<'c>, u32>,
+    deduplicator: HashMap<SimplifiedBoard<'c>, u32, BuildHasherDefault<FxHasher>>,
+}
+
+/// The hash function used by rustc (FxHash). The default SipHash is DoS-resistant but slow, and
+/// deduplication lookups happen for every child of every expanded node.
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+    #[inline]
+    fn add_to_hash(&mut self, i: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(Self::SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            let mut word = [0; 8];
+            word.copy_from_slice(chunk);
+            self.add_to_hash(u64::from_le_bytes(word));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut word = [0; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.add_to_hash(u64::from_le_bytes(word));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.add_to_hash(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.add_to_hash(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
 }
 
 enum Children<'c, R> {
@@ -206,7 +271,7 @@ impl<E: Evaluation<R> + 'static, R: Clone + 'static> DagState<E, R> {
                     },
                     // nothing new will ever be put in the root generation, so we won't bother to
                     // put anything in the hashmap.
-                    deduplicator: HashMap::new(),
+                    deduplicator: HashMap::default(),
                 }
             }));
         // initialize the remaining known generations
@@ -855,7 +920,7 @@ impl<E: 'static, R: 'static> Generation<E, R> {
         Generation::new(Box::new(bumpalo::Bump::with_capacity(1 << 20)), |_| {
             GenerationData {
                 nodes: Vec::with_capacity(1 << 17),
-                deduplicator: HashMap::with_capacity(1 << 17),
+                deduplicator: HashMap::with_capacity_and_hasher(1 << 17, Default::default()),
                 children: Children::Known(piece, Vec::with_capacity(1 << 17)),
             }
         })
@@ -865,7 +930,7 @@ impl<E: 'static, R: 'static> Generation<E, R> {
         Generation::new(Box::new(bumpalo::Bump::with_capacity(1 << 20)), |_| {
             GenerationData {
                 nodes: Vec::with_capacity(1 << 17),
-                deduplicator: HashMap::with_capacity(1 << 17),
+                deduplicator: HashMap::with_capacity_and_hasher(1 << 17, Default::default()),
                 children: Children::Speculated(Vec::with_capacity(1 << 17)),
             }
         })

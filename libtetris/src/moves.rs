@@ -1,15 +1,27 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 
 use arrayvec::ArrayVec;
 use serde::{Deserialize, Serialize};
 
 use crate::{Board, FallingPiece, Piece, PieceMovement, PieceState, RotationState, TspinStatus};
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct InputList {
     pub movements: ArrayVec<[PieceMovement; 32]>,
     pub time: u32,
+}
+
+impl Clone for InputList {
+    fn clone(&self) -> Self {
+        // ArrayVec's Clone impl copies element by element; copy in bulk instead.
+        let mut movements = ArrayVec::new();
+        movements.try_extend_from_slice(&self.movements).unwrap();
+        InputList {
+            movements,
+            time: self.time,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -54,9 +66,46 @@ impl PartialOrd for Placement {
     }
 }
 
+/// A set of positions of a single piece type, stored as a bitset indexed by rotation state, tspin
+/// status and coordinates. This is much faster than hashing each position.
+struct PositionSet {
+    bits: [u64; PositionSet::WORDS],
+}
+
+impl PositionSet {
+    // Unobstructed pieces always have their center within 2 cells of the playfield, so offsetting
+    // coordinates by 3 keeps every index in range.
+    const WIDTH: usize = 16;
+    const HEIGHT: usize = 48;
+    const WORDS: usize = (4 * 3 * Self::WIDTH * Self::HEIGHT + 63) / 64;
+
+    fn new() -> Self {
+        PositionSet {
+            bits: [0; Self::WORDS],
+        }
+    }
+
+    /// Adds the position to the set, returning whether it was not already present.
+    #[inline]
+    fn insert(&mut self, piece: FallingPiece) -> bool {
+        let x = (piece.x + 3) as usize;
+        let y = (piece.y + 3) as usize;
+        assert!(x < Self::WIDTH && y < Self::HEIGHT);
+        let index = ((piece.kind.1 as usize * 3 + piece.tspin as usize) * Self::WIDTH + x)
+            * Self::HEIGHT
+            + y;
+        let word = &mut self.bits[index / 64];
+        let bit = 1 << (index % 64);
+        let new = *word & bit == 0;
+        *word |= bit;
+        new
+    }
+}
+
 pub fn find_moves(board: &Board, mut spawned: FallingPiece, mode: MovementMode) -> Vec<Placement> {
-    let mut locks = HashMap::with_capacity(128);
-    let mut checked = HashSet::with_capacity(128);
+    let mut locks = Vec::with_capacity(64);
+    let mut lock_positions = PositionSet::new();
+    let mut checked = PositionSet::new();
     let mut check_queue = Vec::with_capacity(64);
     let fast_mode;
 
@@ -82,7 +131,7 @@ pub fn find_moves(board: &Board, mut spawned: FallingPiece, mode: MovementMode) 
             if !fast_mode {
                 checked.insert(place);
             }
-            lock_check(place, &mut locks, inputs.clone());
+            lock_check(place, &mut locks, &mut lock_positions, inputs.clone());
             if mode != MovementMode::HardDropOnly {
                 // Initialize stack movement starting positions.
                 inputs.movements.push(PieceMovement::SonicDrop);
@@ -205,13 +254,18 @@ pub fn find_moves(board: &Board, mut spawned: FallingPiece, mode: MovementMode) 
 
         let mut position = position;
         position.sonic_drop(board);
-        lock_check(position, &mut locks, moves);
+        lock_check(position, &mut locks, &mut lock_positions, moves);
     }
 
-    locks.into_iter().map(|(_, v)| v).collect()
+    locks
 }
 
-fn lock_check(piece: FallingPiece, locks: &mut HashMap<FallingPiece, Placement>, moves: InputList) {
+fn lock_check(
+    piece: FallingPiece,
+    locks: &mut Vec<Placement>,
+    lock_positions: &mut PositionSet,
+    moves: InputList,
+) {
     if piece.cells().iter().all(|&(_, y)| y >= 20) {
         return;
     }
@@ -219,17 +273,19 @@ fn lock_check(piece: FallingPiece, locks: &mut HashMap<FallingPiece, Placement>,
     // Since the first path to a location is always the shortest path to that location,
     // we know that if there is already an entry here this isn't a faster path, so only
     // insert placement if there isn't one there already.
-    locks.entry(piece.canonical()).or_insert(Placement {
-        inputs: moves,
-        location: piece,
-    });
+    if lock_positions.insert(piece.canonical()) {
+        locks.push(Placement {
+            inputs: moves,
+            location: piece,
+        });
+    }
 }
 
 fn attempt(
     board: &Board,
     moves: &InputList,
     mut piece: FallingPiece,
-    checked: &mut HashSet<FallingPiece>,
+    checked: &mut PositionSet,
     check_queue: &mut BinaryHeap<Placement>,
     mode: MovementMode,
     fast_mode: bool,
@@ -238,26 +294,28 @@ fn attempt(
 ) -> FallingPiece {
     let orig_y = piece.y;
     if input.apply(&mut piece, board) {
-        let mut moves = moves.clone();
+        // Only the time and number of inputs are tracked until we know the position is new, so
+        // that the input list is only copied when it is actually needed.
+        let mut time = moves.time;
         if input == PieceMovement::SonicDrop {
             // We don't actually know the soft drop speed, but 1 cell every 2 ticks is probably a
             // decent guess - that's what the battle library's default game configuration has, and
             // it's also pretty close to Puyo Puyo Tetris's versus mode.
-            moves.time += 2 * (orig_y - piece.y) as u32;
+            time += 2 * (orig_y - piece.y) as u32;
         } else {
-            moves.time += 1;
+            time += 1;
         }
         if let Some(&m) = moves.movements.last() {
             if m == input {
                 // Delay from releasing button before pressing it again
-                moves.time += 1;
+                time += 1;
             }
         }
-        moves.movements.push(input);
-        while repeat && !moves.movements.is_full() && input.apply(&mut piece, board) {
+        let mut len = moves.movements.len() + 1;
+        while repeat && len < moves.movements.capacity() && input.apply(&mut piece, board) {
             // This is the DAS left/right case
-            moves.movements.push(input);
-            moves.time += 2;
+            len += 1;
+            time += 2;
         }
         if !fast_mode || piece.tspin != TspinStatus::None || !board.above_stack(&piece) {
             // 20G causes instant plummet, but we might actually be playing a high gravity mode
@@ -265,12 +323,18 @@ fn attempt(
             // the input engine that we need the piece to hit the ground before continuing.
             let drop_input = mode == MovementMode::TwentyG && piece.sonic_drop(board);
             if checked.insert(piece) {
-                if drop_input && !moves.movements.is_full() {
-                    // We need the sonic drop input for the above reason, but if the move list is
-                    // full this has to be the last move and the input engine should hard drop.
-                    moves.movements.push(PieceMovement::SonicDrop);
-                }
                 if !(mode == MovementMode::HardDropOnly && input == PieceMovement::SonicDrop) {
+                    let mut moves = moves.clone();
+                    moves.time = time;
+                    while moves.movements.len() < len {
+                        moves.movements.push(input);
+                    }
+                    if drop_input && !moves.movements.is_full() {
+                        // We need the sonic drop input for the above reason, but if the move list
+                        // is full this has to be the last move and the input engine should hard
+                        // drop.
+                        moves.movements.push(PieceMovement::SonicDrop);
+                    }
                     check_queue.push(Placement {
                         inputs: moves,
                         location: piece,

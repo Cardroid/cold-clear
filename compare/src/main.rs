@@ -8,7 +8,14 @@ use serde::{Deserialize, Serialize};
 use statrs::distribution::{Binomial, Univariate};
 
 mod input;
-use input::BotInput;
+use input::{BotInput, THINK_AMOUNT};
+
+/// Reads a per-player thinking time (in microseconds per frame) from the environment.
+fn think_amount(var: &str) -> std::time::Duration {
+    std::env::var(var).ok().map_or(THINK_AMOUNT, |v| {
+        std::time::Duration::from_micros(v.parse().expect("invalid think time"))
+    })
+}
 
 fn main() {
     use cold_clear::evaluation::{changed, Standard};
@@ -17,9 +24,18 @@ fn main() {
 
     let p2_eval = changed::Standard::default();
 
+    let mut args = std::env::args().skip(1);
+    let games: u64 = args
+        .next()
+        .map_or(20000, |s| s.parse().expect("invalid game count"));
+    let threads: usize = args.next().map_or_else(
+        || std::thread::available_parallelism().map_or(4, |n| n.get()),
+        |s| s.parse().expect("invalid thread count"),
+    );
+
     let (send, recv) = std::sync::mpsc::channel();
 
-    for _ in 0..12 {
+    for _ in 0..threads {
         let p1_eval = p1_eval.clone();
         let p2_eval = p2_eval.clone();
         let send = send.clone();
@@ -35,8 +51,6 @@ fn main() {
 
     let mut p1_wins = 0;
     let mut p2_wins = 0;
-
-    let games = 20000;
 
     while p1_wins + p2_wins < games {
         match recv.recv() {
@@ -58,6 +72,14 @@ fn main() {
             Err(_) => break,
         }
     }
+    let total = (p1_wins + p2_wins) as f64;
+    let p2_rate = p2_wins as f64 / total;
+    let stderr = (p2_rate * (1.0 - p2_rate) / total).sqrt();
+    println!(
+        "p2 win rate = {:.2}% ± {:.2}% (95% CI)",
+        p2_rate * 100.0,
+        stderr * 196.0
+    );
     let distr = Binomial::new(0.5, p1_wins + p2_wins).unwrap();
     let p = distr.cdf(p1_wins as f64);
     println!("p = {:.4}", p);
@@ -75,8 +97,16 @@ fn do_battle(p1: impl Evaluator + Clone, p2: impl Evaluator + Clone) -> (InfoRep
     battle.replay.p1_name = format!("Cold Clear\n{}", p1.name());
     battle.replay.p2_name = format!("Cold Clear\n{}", p2.name());
 
-    let mut p1 = BotInput::new(battle.player_1.board.to_compressed(), p1);
-    let mut p2 = BotInput::new(battle.player_2.board.to_compressed(), p2);
+    let mut p1 = BotInput::new(
+        battle.player_1.board.to_compressed(),
+        p1,
+        think_amount("CC_P1_THINK_US"),
+    );
+    let mut p2 = BotInput::new(
+        battle.player_2.board.to_compressed(),
+        p2,
+        think_amount("CC_P2_THINK_US"),
+    );
 
     let mut p1_info_updates = VecDeque::new();
     let mut p2_info_updates = VecDeque::new();
