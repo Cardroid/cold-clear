@@ -8,18 +8,21 @@ pub struct BotInput<E: Evaluator> {
     pub controller: Controller,
     executing: Option<(FallingPiece, PieceMoveExecutor)>,
     time_budget: Duration,
+    think_amount: Duration,
     bot: cold_clear::BotState<E>,
     eval: E,
 }
 
-const THINK_AMOUNT: Duration = Duration::from_millis(4);
+/// Default amount of thinking time per frame.
+pub const THINK_AMOUNT: Duration = Duration::from_millis(4);
 
 impl<E: Evaluator> BotInput<E> {
-    pub fn new(board: Board, eval: E) -> Self {
+    pub fn new(board: Board, eval: E, think_amount: Duration) -> Self {
         let mut this = BotInput {
             controller: Controller::default(),
             executing: None,
             time_budget: Duration::new(0, 0),
+            think_amount,
             bot: cold_clear::BotState::new(board, Default::default()),
             eval,
         };
@@ -32,7 +35,7 @@ impl<E: Evaluator> BotInput<E> {
 
     fn think(&mut self) {
         std::thread::yield_now(); // get a new timeslice
-        while self.time_budget < THINK_AMOUNT {
+        while self.time_budget < self.think_amount {
             let start = Instant::now();
             match self.bot.think() {
                 Ok(thinker) => {
@@ -40,13 +43,13 @@ impl<E: Evaluator> BotInput<E> {
                 }
                 Err(_) => {
                     // can't think anymore
-                    self.time_budget = THINK_AMOUNT;
+                    self.time_budget = self.think_amount;
                     break;
                 }
             }
             self.time_budget += start.elapsed();
         }
-        self.time_budget -= THINK_AMOUNT;
+        self.time_budget -= self.think_amount;
     }
 
     pub fn update(

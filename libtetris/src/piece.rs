@@ -296,27 +296,13 @@ impl PieceState {
     /// as the connection directions, in no particular order.
     #[inline(always)]
     pub fn cells(&self) -> [(i32, i32); 4] {
-        macro_rules! gen_cells {
-            ($([$(($x:expr, $y:expr)),*]),*) => {
-                [$(
-                    [$(($x, $y)),*],   // North
-                    [$((-$x, -$y)),*], // South
-                    [$(($y, -$x)),*],  // East
-                    [$((-$y, $x)),*]   // West
-                ),*]
-            };
-        }
-        const CELLS: &'static [[(i32, i32); 4]] = &gen_cells![
-            [(-1, 0), (0, 0), (1, 0), (2, 0)],  // I
-            [(0, 0), (1, 0), (0, 1), (1, 1)],   // O
-            [(-1, 0), (0, 0), (1, 0), (0, 1)],  // T
-            [(-1, 0), (0, 0), (1, 0), (1, 1)],  // L
-            [(-1, 0), (0, 0), (1, 0), (-1, 1)], // J
-            [(-1, 0), (0, 0), (0, 1), (1, 1)],  // S
-            [(-1, 1), (0, 1), (0, 0), (1, 0)]   // Z
-        ];
-        let index = self.0 as usize * 4 + self.1 as usize;
-        CELLS[index]
+        PIECE_CELLS[self.index()]
+    }
+
+    /// Index of this piece and orientation into per-state tables.
+    #[inline(always)]
+    pub(crate) fn index(&self) -> usize {
+        self.0 as usize * 4 + self.1 as usize
     }
 
     pub fn cells_with_connections(&self) -> [(i32, i32, EnumSet<Direction>); 4] {
@@ -550,3 +536,26 @@ impl SpawnRule {
         None
     }
 }
+
+macro_rules! gen_cells {
+    ($([$(($x:expr, $y:expr)),*]),*) => {
+        [$(
+            [$(($x, $y)),*],   // North
+            [$((-$x, -$y)),*], // South
+            [$(($y, -$x)),*],  // East
+            [$((-$y, $x)),*]   // West
+        ),*]
+    };
+}
+
+/// The cells each piece and orientation occupy relative to rotation point 1, indexed by
+/// `PieceState::index`.
+pub(crate) const PIECE_CELLS: [[(i32, i32); 4]; 28] = gen_cells![
+    [(-1, 0), (0, 0), (1, 0), (2, 0)],  // I
+    [(0, 0), (1, 0), (0, 1), (1, 1)],   // O
+    [(-1, 0), (0, 0), (1, 0), (0, 1)],  // T
+    [(-1, 0), (0, 0), (1, 0), (1, 1)],  // L
+    [(-1, 0), (0, 0), (1, 0), (-1, 1)], // J
+    [(-1, 0), (0, 0), (0, 1), (1, 1)],  // S
+    [(-1, 1), (0, 1), (0, 0), (1, 0)]   // Z
+];

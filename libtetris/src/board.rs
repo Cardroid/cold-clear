@@ -1,26 +1,53 @@
-use std::collections::VecDeque;
 use std::iter::DoubleEndedIterator;
 
 use arrayvec::ArrayVec;
 use enumset::EnumSet;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::*;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Board<R = u16> {
     cells: ArrayVec<[R; 40]>,
     column_heights: [i32; 10],
     pub combo: u32,
     pub b2b_bonus: bool,
     pub hold_piece: Option<Piece>,
-    next_pieces: VecDeque<Piece>,
+    /// Stored inline so that cloning a board (which happens for every generated placement)
+    /// doesn't need to allocate. Longer queues spill to the heap.
+    next_pieces: SmallVec<[Piece; 16]>,
     pub bag: EnumSet<Piece>,
+}
+
+impl<R: Row> Clone for Board<R> {
+    fn clone(&self) -> Self {
+        // ArrayVec's Clone impl copies element by element, which is noticeably slow for a type
+        // that is cloned as often as this one. The rows are Copy, so copy them in bulk instead.
+        let mut cells = ArrayVec::new();
+        cells.try_extend_from_slice(&self.cells).unwrap();
+        Board {
+            cells,
+            column_heights: self.column_heights,
+            combo: self.combo,
+            b2b_bonus: self.b2b_bonus,
+            hold_piece: self.hold_piece,
+            next_pieces: self.next_pieces.clone(),
+            bag: self.bag,
+        }
+    }
 }
 
 pub trait Row: Copy + Clone + 'static {
     fn set(&mut self, x: usize, color: CellColor);
     fn get(&self, x: usize) -> bool;
+
+    /// Returns whether any of the cells in `mask` (bit `x` for column `x`) are filled.
+    #[inline]
+    fn intersects(&self, mask: u16) -> bool {
+        (0..10).any(|x| mask & 1 << x != 0 && self.get(x))
+    }
+
     fn is_full(&self) -> bool;
     fn is_empty(&self) -> bool;
     fn cell_color(&self, x: usize) -> CellColor;
@@ -38,7 +65,7 @@ impl<R: Row> Board<R> {
             combo: 0,
             b2b_bonus: false,
             hold_piece: None,
-            next_pieces: VecDeque::new(),
+            next_pieces: SmallVec::new(),
             bag: EnumSet::all(),
         }
     }
@@ -57,7 +84,7 @@ impl<R: Row> Board<R> {
             combo: combo,
             b2b_bonus: b2b,
             hold_piece: hold,
-            next_pieces: VecDeque::new(),
+            next_pieces: SmallVec::new(),
             bag: if bag_remain.is_empty() {
                 EnumSet::all()
             } else {
@@ -82,7 +109,7 @@ impl<R: Row> Board<R> {
     ///
     /// If the queue is empty, returns the set of possible next pieces.
     pub fn get_next_piece(&self) -> Result<Piece, EnumSet<Piece>> {
-        self.next_pieces.front().copied().ok_or(self.bag)
+        self.next_pieces.first().copied().ok_or(self.bag)
     }
 
     /// Retrieves the piece after the next piece in the queue if it is known.
@@ -98,11 +125,15 @@ impl<R: Row> Board<R> {
         if self.bag.is_empty() {
             self.bag = EnumSet::all();
         }
-        self.next_pieces.push_back(piece);
+        self.next_pieces.push(piece);
     }
 
     fn remove_cleared_lines(&mut self) -> ArrayVec<[i32; 4]> {
         let mut cleared = ArrayVec::new();
+        // Fast path: most placements don't clear any lines.
+        if !self.cells.iter().any(|r| r.is_full()) {
+            return cleared;
+        }
         let mut lineno = 0;
         self.cells.retain(|r| {
             let full = r.is_full();
@@ -127,8 +158,10 @@ impl<R: Row> Board<R> {
         cleared
     }
 
+    #[inline]
     pub fn occupied(&self, x: i32, y: i32) -> bool {
-        x < 0 || y < 0 || x >= 10 || y >= 40 || (self.cells[y as usize].get(x as usize))
+        // casting to unsigned turns negative coordinates into out of range ones
+        x as u32 >= 10 || y as u32 >= 40 || self.cells[y as usize].get(x as usize)
     }
 
     pub fn get_row(&self, y: i32) -> &R {
@@ -154,7 +187,20 @@ impl<R: Row> Board<R> {
     }
 
     pub fn obstructed(&self, piece: &FallingPiece) -> bool {
-        piece.cells().iter().any(|&(x, y)| self.occupied(x, y))
+        // Equivalent to checking `occupied` for each cell, but tests a whole row of the piece at
+        // once using a precomputed mask.
+        let shape = &SHAPE_MASKS[piece.kind.index()];
+        let left = piece.x + shape.min_dx;
+        let bottom = piece.y + shape.min_dy;
+        if left < 0 || piece.x + shape.max_dx >= 10 || bottom < 0 || piece.y + shape.max_dy >= 40 {
+            return true;
+        }
+        for i in 0..shape.height {
+            if self.cells[(bottom + i) as usize].intersects(shape.rows[i as usize] << left) {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn above_stack(&self, piece: &FallingPiece) -> bool {
@@ -249,7 +295,11 @@ impl<R: Row> Board<R> {
 
     /// Returns the piece that should be spawned, or None if the queue is empty.
     pub fn advance_queue(&mut self) -> Option<Piece> {
-        self.next_pieces.pop_front()
+        if self.next_pieces.is_empty() {
+            None
+        } else {
+            Some(self.next_pieces.remove(0))
+        }
     }
 
     pub fn column_heights(&self) -> &[i32; 10] {
@@ -332,7 +382,79 @@ impl<R: Row> Board<R> {
     }
 }
 
+/// Row masks of a piece shape, relative to its lowest row and leftmost column.
+struct ShapeMasks {
+    min_dx: i32,
+    max_dx: i32,
+    min_dy: i32,
+    max_dy: i32,
+    height: i32,
+    rows: [u16; 4],
+}
+
+const fn shape_masks(cells: [(i32, i32); 4]) -> ShapeMasks {
+    let mut min_dx = cells[0].0;
+    let mut max_dx = cells[0].0;
+    let mut min_dy = cells[0].1;
+    let mut max_dy = cells[0].1;
+    let mut i = 1;
+    while i < 4 {
+        let (x, y) = cells[i];
+        if x < min_dx {
+            min_dx = x;
+        }
+        if x > max_dx {
+            max_dx = x;
+        }
+        if y < min_dy {
+            min_dy = y;
+        }
+        if y > max_dy {
+            max_dy = y;
+        }
+        i += 1;
+    }
+    let mut rows = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        let (x, y) = cells[i];
+        rows[(y - min_dy) as usize] |= 1 << (x - min_dx);
+        i += 1;
+    }
+    ShapeMasks {
+        min_dx,
+        max_dx,
+        min_dy,
+        max_dy,
+        height: max_dy - min_dy + 1,
+        rows,
+    }
+}
+
+static SHAPE_MASKS: [ShapeMasks; 28] = {
+    const EMPTY: ShapeMasks = ShapeMasks {
+        min_dx: 0,
+        max_dx: 0,
+        min_dy: 0,
+        max_dy: 0,
+        height: 0,
+        rows: [0; 4],
+    };
+    let mut table = [EMPTY; 28];
+    let mut i = 0;
+    while i < 28 {
+        table[i] = shape_masks(PIECE_CELLS[i]);
+        i += 1;
+    }
+    table
+};
+
 impl Row for u16 {
+    #[inline]
+    fn intersects(&self, mask: u16) -> bool {
+        *self & mask != 0
+    }
+
     fn set(&mut self, x: usize, color: CellColor) {
         if color == CellColor::Empty {
             *self &= !(1 << x);
@@ -398,4 +520,73 @@ impl Row for ColoredRow {
 
     const SOLID: &'static Self = &ColoredRow([CellColor::Unclearable; 10]);
     const EMPTY: &'static Self = &ColoredRow([CellColor::Empty; 10]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::prelude::*;
+
+    fn check_obstructed<R: Row>(board: &Board<R>) {
+        for &p in &[
+            Piece::I,
+            Piece::O,
+            Piece::T,
+            Piece::L,
+            Piece::J,
+            Piece::S,
+            Piece::Z,
+        ] {
+            for &r in &[
+                RotationState::North,
+                RotationState::East,
+                RotationState::South,
+                RotationState::West,
+            ] {
+                for x in -4..14 {
+                    for y in -4..44 {
+                        let piece = FallingPiece {
+                            kind: PieceState(p, r),
+                            x,
+                            y,
+                            tspin: TspinStatus::None,
+                        };
+                        let expected = piece.cells().iter().any(|&(x, y)| board.occupied(x, y));
+                        assert_eq!(board.obstructed(&piece), expected, "{:?}", piece);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn obstructed_matches_cell_check() {
+        let mut rng = StdRng::seed_from_u64(0);
+        for _ in 0..50 {
+            let mut field = [[false; 10]; 40];
+            let height = rng.gen_range(0, 40);
+            for row in field.iter_mut().take(height) {
+                for cell in row.iter_mut() {
+                    *cell = rng.gen_bool(0.6);
+                }
+            }
+            let mut board = Board::<u16>::new();
+            board.set_field(field);
+            check_obstructed(&board);
+            let mut colored = Board::<ColoredRow>::new();
+            colored.set_field(field);
+            check_obstructed(&colored);
+        }
+    }
+
+    #[test]
+    fn clone_is_equal() {
+        let mut board = Board::<u16>::new();
+        board.add_garbage(3);
+        board.add_next_piece(Piece::T);
+        board.hold_piece = Some(Piece::I);
+        board.combo = 2;
+        let clone = board.clone();
+        assert_eq!(format!("{:?}", board), format!("{:?}", clone));
+    }
 }

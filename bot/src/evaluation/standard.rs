@@ -261,13 +261,15 @@ impl Evaluator for Standard {
             1 + (board.hold_piece == Some(Piece::T)) as usize
         };
 
-        let mut board = board.clone();
+        // Only clone the board once a T slot is actually cut out of it.
+        let mut cutout_board: Option<Board> = None;
         for _ in 0..ts {
-            let cutout_location = sky_tslot_left(&board)
-                .or_else(|| sky_tslot_right(&board))
+            let board = cutout_board.as_ref().unwrap_or(board);
+            let cutout_location = sky_tslot_left(board)
+                .or_else(|| sky_tslot_right(board))
                 .or_else(|| {
-                    let tst = tst_twist_left(&board).or_else(|| tst_twist_right(&board))?;
-                    cave_tslot(&board, tst).or_else(|| {
+                    let tst = tst_twist_left(board).or_else(|| tst_twist_right(board))?;
+                    cave_tslot(board, tst).or_else(|| {
                         let corners = board.occupied(tst.x - 1, tst.y - 1) as usize
                             + board.occupied(tst.x + 1, tst.y - 1) as usize
                             + board.occupied(tst.x - 1, tst.y + 1) as usize
@@ -279,19 +281,20 @@ impl Evaluator for Standard {
                         }
                     })
                 })
-                .or_else(|| fin_left(&board))
-                .or_else(|| fin_right(&board));
+                .or_else(|| fin_left(board))
+                .or_else(|| fin_right(board));
             let result = match cutout_location {
                 Some(location) => cutout_tslot(board.clone(), location),
                 None => break,
             };
             transient_eval += self.tslot[result.lines];
             if let Some(b) = result.result {
-                board = b;
+                cutout_board = Some(b);
             } else {
                 break;
             }
         }
+        let board = cutout_board.as_ref().unwrap_or(board);
 
         let highest_point = *board.column_heights().iter().max().unwrap() as i32;
         transient_eval += self.height * highest_point;
@@ -304,11 +307,10 @@ impl Evaluator for Standard {
         }
 
         let mut depth = 0;
-        'yloop: for y in board.column_heights()[well]..20 {
-            for x in 0..10 {
-                if x as usize != well && !board.occupied(x, y) {
-                    break 'yloop;
-                }
+        for y in board.column_heights()[well]..20 {
+            // every column except the well must be filled
+            if *board.get_row(y) | 1 << well != 0b11111_11111 {
+                break;
             }
             depth += 1;
         }
@@ -319,12 +321,15 @@ impl Evaluator for Standard {
         }
 
         if self.row_transitions != 0 {
+            // Rows at or above the highest point are empty and have exactly 2 transitions each
+            // (the walls on either side).
             transient_eval += self.row_transitions
-                * (0..40)
+                * ((0..highest_point)
                     .map(|y| *board.get_row(y))
                     .map(|r| (r | 0b1_00000_00000) ^ (1 | r << 1))
                     .map(|d| d.count_ones() as i32)
-                    .sum::<i32>();
+                    .sum::<i32>()
+                    + 2 * (40 - highest_point));
         }
 
         if self.bumpiness | self.bumpiness_sq != 0 {
@@ -333,20 +338,21 @@ impl Evaluator for Standard {
             transient_eval += bump_sq * self.bumpiness_sq;
         }
 
-        if self.cavity_cells | self.cavity_cells_sq | self.overhang_cells | self.overhang_cells_sq
+        if self.cavity_cells
+            | self.cavity_cells_sq
+            | self.overhang_cells
+            | self.overhang_cells_sq
+            | self.covered_cells
+            | self.covered_cells_sq
             != 0
         {
-            let (cavity_cells, overhang_cells) = cavities_and_overhangs(&board);
-            transient_eval += self.cavity_cells * cavity_cells;
-            transient_eval += self.cavity_cells_sq * cavity_cells * cavity_cells;
-            transient_eval += self.overhang_cells * overhang_cells;
-            transient_eval += self.overhang_cells_sq * overhang_cells * overhang_cells;
-        }
-
-        if self.covered_cells | self.covered_cells_sq != 0 {
-            let (covered_cells, covered_cells_sq) = covered_cells(&board);
-            transient_eval += self.covered_cells * covered_cells;
-            transient_eval += self.covered_cells_sq * covered_cells_sq;
+            let holes = holes(board);
+            transient_eval += self.cavity_cells * holes.cavities;
+            transient_eval += self.cavity_cells_sq * holes.cavities * holes.cavities;
+            transient_eval += self.overhang_cells * holes.overhangs;
+            transient_eval += self.overhang_cells_sq * holes.overhangs * holes.overhangs;
+            transient_eval += self.covered_cells * holes.covered;
+            transient_eval += self.covered_cells_sq * holes.covered_sq;
         }
 
         (
@@ -389,60 +395,60 @@ fn bumpiness(board: &Board, well: usize) -> (i32, i32) {
     (bumpiness.abs() as i32, bumpiness_sq.abs() as i32)
 }
 
-/// Evaluates the holes in the playfield.
-///
-/// The first returned value is the number of cells that make up fully enclosed spaces (cavities).
-/// The second is the number of cells that make up partially enclosed spaces (overhangs).
-fn cavities_and_overhangs(board: &Board) -> (i32, i32) {
-    let mut cavities = 0;
-    let mut overhangs = 0;
-
-    for y in 0..*board.column_heights().iter().max().unwrap() {
-        for x in 0..10 {
-            if board.occupied(x as i32, y) || y >= board.column_heights()[x] {
-                continue;
-            }
-
-            if x > 1 {
-                if board.column_heights()[x - 1] <= y - 1 && board.column_heights()[x - 2] <= y {
-                    overhangs += 1;
-                    continue;
-                }
-            }
-
-            if x < 8 {
-                if board.column_heights()[x + 1] <= y - 1 && board.column_heights()[x + 2] <= y {
-                    overhangs += 1;
-                    continue;
-                }
-            }
-
-            cavities += 1;
-        }
-    }
-
-    (cavities, overhangs)
+struct Holes {
+    /// The number of empty cells below the surface that make up fully enclosed spaces.
+    cavities: i32,
+    /// The number of empty cells below the surface that make up partially enclosed spaces.
+    overhangs: i32,
+    /// For each empty cell at least 2 cells below the top of its column, the number of filled
+    /// cells covering it (capped at 6), summed.
+    covered: i32,
+    /// The sum of the squares of the values summed for `covered`.
+    covered_sq: i32,
 }
 
-/// Evaluates how covered holes in the playfield are.
+/// Evaluates the holes in the playfield.
 ///
-/// The first returned value is the number of filled cells cover the topmost hole in the columns.
-/// The second value is the sum of the squares of those values.
-fn covered_cells(board: &Board) -> (i32, i32) {
-    let mut covered = 0;
-    let mut covered_sq = 0;
+/// Operates on whole rows at once: only the empty cells below the surface are visited.
+fn holes(board: &Board) -> Holes {
+    let heights = board.column_heights();
+    let highest_point = *heights.iter().max().unwrap();
 
-    for x in 0..10 {
-        for y in (0..board.column_heights()[x] - 2).rev() {
-            if !board.occupied(x as i32, y) {
-                let cells = 6.min(board.column_heights()[x] - y - 1);
-                covered += cells;
-                covered_sq += cells * cells;
+    let mut result = Holes {
+        cavities: 0,
+        overhangs: 0,
+        covered: 0,
+        covered_sq: 0,
+    };
+
+    // Columns with a filled cell at or above the current row. Iterating from the top down lets
+    // us accumulate this instead of comparing against every column height for every row.
+    let mut below_surface = 0;
+    for y in (0..highest_point).rev() {
+        let row = *board.get_row(y);
+        below_surface |= row;
+        let mut empty = below_surface & !row;
+        while empty != 0 {
+            let x = empty.trailing_zeros() as usize;
+            empty &= empty - 1;
+
+            if y < heights[x] - 2 {
+                let cells = 6.min(heights[x] - y - 1);
+                result.covered += cells;
+                result.covered_sq += cells * cells;
+            }
+
+            if x > 1 && heights[x - 1] <= y - 1 && heights[x - 2] <= y {
+                result.overhangs += 1;
+            } else if x < 8 && heights[x + 1] <= y - 1 && heights[x + 2] <= y {
+                result.overhangs += 1;
+            } else {
+                result.cavities += 1;
             }
         }
     }
 
-    (covered, covered_sq)
+    result
 }
 
 macro_rules! detect_shape {
